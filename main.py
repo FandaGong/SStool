@@ -4,9 +4,12 @@ import io
 import time
 import json
 import re
+import shutil
+import tempfile
 import threading
 import subprocess
 import ctypes
+import ctypes.util
 from ctypes import c_bool, c_void_p, c_char_p, c_long, c_uint32, POINTER
 
 import objc
@@ -33,11 +36,38 @@ from AppKit import (
 )
 from google import genai
 
-CONFIG_FILE = os.path.expanduser("~/.ai_solver_config.json")
+# ==============================================================================
+# PyInstaller & Bundle-Safe Relative Paths
+# ==============================================================================
+
+def get_bundle_dir():
+    """Returns base directory for bundled assets (supports PyInstaller _MEIPASS)."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_resource_path(relative_path):
+    """Resolves resource path relative to runtime bundle."""
+    return os.path.join(get_bundle_dir(), relative_path)
+
+
+def get_config_path():
+    """
+    Returns standard persistent config path in ~/Library/Application Support/
+    to prevent permission/signing errors inside macOS .app bundles.
+    """
+    app_support = os.path.expanduser("~/Library/Application Support/AI_Overlay_Solver")
+    try:
+        os.makedirs(app_support, exist_ok=True)
+        return os.path.join(app_support, "config.json")
+    except Exception:
+        return os.path.expanduser("~/.ai_solver_config.json")
+
+
+CONFIG_FILE = get_config_path()
 MODIFIER_ORDER = ["cmd", "ctrl", "opt", "shift"]
 FAINT_TEXT_OPACITY = 0.20
-
-# Window sharing mode: 0 = NSWindowSharingNone (Excluded from screencapture & recordings)
 NS_WINDOW_SHARING_NONE = 0
 
 EMOJI_REGEX = re.compile(
@@ -51,8 +81,11 @@ EMOJI_REGEX = re.compile(
 
 def check_and_request_accessibility(prompt=True):
     try:
-        app_services = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
-        core_foundation = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        app_services_name = ctypes.util.find_library("ApplicationServices") or "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        core_foundation_name = ctypes.util.find_library("CoreFoundation") or "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+
+        app_services = ctypes.CDLL(app_services_name)
+        core_foundation = ctypes.CDLL(core_foundation_name)
 
         cfstr_create = core_foundation.CFStringCreateWithCString
         cfstr_create.restype = c_void_p
@@ -166,17 +199,17 @@ def load_config():
     defaults = {
         "api_key": "",
         "model_name": "gemini-3.7-flash",
-        "text_color": [0.35, 0.95, 0.55, 1.0],   # Terminal Phosphor Green
-        "bg_color": [0.06, 0.07, 0.09],          # Dark Stealth Neutral
-        "overlay_opacity": 0.85,                 # Master Window Opacity
-        "window_bg_opacity": 0.85,               # Background Fill Opacity
-        "text_opacity": 1.0,                     # Text Opacity
-        "timer_opacity": 0.85,                   # Countdown Timer Opacity
-        "show_dividers": True,                   # Enable/Disable --- dividers
-        "show_emojis": True,                     # Enable/Disable emojis
-        "log_ai_only": False,                    # Silent Mode (Only AI Output)
-        "log_actions": True,                     # Action/Buffer capture logs
-        "log_hotkeys": True,                     # Hotkey/Mode trigger logs
+        "text_color": [0.35, 0.95, 0.55, 1.0],
+        "bg_color": [0.06, 0.07, 0.09],
+        "overlay_opacity": 0.85,
+        "window_bg_opacity": 0.85,
+        "text_opacity": 1.0,
+        "timer_opacity": 0.85,
+        "show_dividers": True,
+        "show_emojis": True,
+        "log_ai_only": False,
+        "log_actions": True,
+        "log_hotkeys": True,
         "prompts": [
             "solve this for me",
             "summarize and provide a step-by-step concise answer",
@@ -250,7 +283,7 @@ class RegionEditOverlay(NSWindow):
         self.setMovableByWindowBackground_(True)
         self.setAcceptsMouseMovedEvents_(True)
         self.setHidesOnDeactivate_(False)
-        self.setSharingType_(NS_WINDOW_SHARING_NONE)  # Exclude from screenshots
+        self.setSharingType_(NS_WINDOW_SHARING_NONE)
 
         self.overlay_view = NSTextField.alloc().initWithFrame_(self.contentView().bounds())
         self.overlay_view.setEditable_(False)
@@ -300,7 +333,7 @@ class CountdownOverlay(NSWindow):
         self.setCanHide_(False)
         self.setHidesOnDeactivate_(False)
         self.setIgnoresMouseEvents_(True)
-        self.setSharingType_(NS_WINDOW_SHARING_NONE)  # Exclude from screenshots
+        self.setSharingType_(NS_WINDOW_SHARING_NONE)
         self.setCollectionBehavior_(
             NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary
         )
@@ -400,7 +433,7 @@ class AIOverlayPanel(NSWindow):
         self.setShowsResizeIndicator_(True)
         self.setAcceptsMouseMovedEvents_(True)
         self.setIgnoresMouseEvents_(False)
-        self.setSharingType_(NS_WINDOW_SHARING_NONE)  # Exclude from screencapture
+        self.setSharingType_(NS_WINDOW_SHARING_NONE)
         self.setCollectionBehavior_(
             NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary
         )
@@ -864,7 +897,7 @@ class SettingsWindow(NSWindow):
         cfg["normal_key"] = normalize_hotkey(self.normal_field.stringValue()) or "s"
         cfg["scroll_key"] = normalize_hotkey(self.scroll_field.stringValue()) or "c"
         cfg["toggle_key"] = normalize_hotkey(self.toggle_field.stringValue()) or "z"
-        cfg["toggle_window_key"] = normalize_hotkey(self.toggle_field.stringValue()) or "h"
+        cfg["toggle_window_key"] = normalize_hotkey(self.toggle_window_field.stringValue()) or "h"
         cfg["clear_key"] = normalize_hotkey(self.clear_field.stringValue()) or "x"
         cfg["edit_region_key"] = normalize_hotkey(self.edit_region_field.stringValue()) or "r"
         cfg["auto_mode_key"] = normalize_hotkey(self.auto_mode_field.stringValue()) or "a"
@@ -1364,14 +1397,18 @@ class AppDelegate:
             self.log_to_window("❌ [Error] API Client uninitialized. Set your API Key in Settings GUI.", tag="ai")
             return
 
+        # Use bundle-safe unique temporary file in tempfile.gettempdir()
+        temp_img = os.path.join(tempfile.gettempdir(), f"ai_solver_snap_{os.getpid()}.png")
+
         try:
-            temp_img = "/tmp/ai_solver_snap.png"
+            # Dynamically resolve screencapture executable for .app bundle environments
+            screencapture_bin = shutil.which("screencapture") or "/usr/sbin/screencapture"
 
             if self.selected_crop_area:
                 x, y, w, h = self.selected_crop_area
-                subprocess.run(["screencapture", "-x", f"-R{x},{y},{w},{h}", temp_img], check=True)
+                subprocess.run([screencapture_bin, "-x", f"-R{x},{y},{w},{h}", temp_img], check=True)
             else:
-                subprocess.run(["screencapture", "-x", temp_img], check=True)
+                subprocess.run([screencapture_bin, "-x", temp_img], check=True)
 
             if not os.path.exists(temp_img):
                 raise Exception("Failed to write screenshot buffer.")
@@ -1401,6 +1438,11 @@ class AppDelegate:
 
         except Exception as e:
             self.log_to_window(f"⚠️ [Pipeline Error]: {str(e)}", tag="ai")
+            if os.path.exists(temp_img):
+                try:
+                    os.remove(temp_img)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
