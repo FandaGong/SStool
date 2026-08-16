@@ -1,0 +1,13 @@
+[project]
+name = "sstool"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "google-genai>=2.18.1",
+    "pillow>=12.3.0",
+    "pyautogui>=0.9.54",
+    "pyobjc-framework-cocoa>=12.2.2",
+    "pyobjc-framework-quartz>=12.2.2",
+]
