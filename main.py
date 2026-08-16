@@ -37,35 +37,13 @@ from AppKit import (
 from google import genai
 
 # ==============================================================================
-# PyInstaller & Bundle-Safe Relative Paths
+# Local Project Directory & Configuration Path
 # ==============================================================================
 
-def get_bundle_dir():
-    """Returns base directory for bundled assets (supports PyInstaller _MEIPASS)."""
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        return sys._MEIPASS
-    return os.path.dirname(os.path.abspath(__file__))
+SCRIPT_PATH = os.path.abspath(__file__) if "__file__" in globals() else os.path.abspath(sys.argv[0])
+PROJECT_DIR = os.path.dirname(SCRIPT_PATH)
+CONFIG_FILE = os.path.join(PROJECT_DIR, "ai_solver_config.json")
 
-
-def get_resource_path(relative_path):
-    """Resolves resource path relative to runtime bundle."""
-    return os.path.join(get_bundle_dir(), relative_path)
-
-
-def get_config_path():
-    """
-    Returns standard persistent config path in ~/Library/Application Support/
-    to prevent permission/signing errors inside macOS .app bundles.
-    """
-    app_support = os.path.expanduser("~/Library/Application Support/AI_Overlay_Solver")
-    try:
-        os.makedirs(app_support, exist_ok=True)
-        return os.path.join(app_support, "config.json")
-    except Exception:
-        return os.path.expanduser("~/.ai_solver_config.json")
-
-
-CONFIG_FILE = get_config_path()
 MODIFIER_ORDER = ["cmd", "ctrl", "opt", "shift"]
 FAINT_TEXT_OPACITY = 0.20
 NS_WINDOW_SHARING_NONE = 0
@@ -76,7 +54,7 @@ EMOJI_REGEX = re.compile(
 
 
 # ==============================================================================
-# Low-Level macOS C-API & Accessibility Verifications (skhd style)
+# Low-Level macOS C-API & Accessibility / Screen Permissions
 # ==============================================================================
 
 def check_and_request_accessibility(prompt=True):
@@ -107,6 +85,91 @@ def check_and_request_accessibility(prompt=True):
         return bool(ax_trusted(options))
     except Exception:
         return False
+
+
+def check_and_request_screen_recording():
+    """Checks and prompts for macOS Screen Recording permission (macOS 10.15+)."""
+    try:
+        has_access = Quartz.CGPreflightScreenCaptureAccess()
+        if not has_access:
+            Quartz.CGRequestScreenCaptureAccess()
+            has_access = Quartz.CGPreflightScreenCaptureAccess()
+        return bool(has_access)
+    except Exception:
+        return True
+
+
+# ==============================================================================
+# Native In-Memory Screen Capture Engine (Quartz + PIL)
+# ==============================================================================
+
+def capture_screen_to_pil(bounds=None):
+    """
+    Captures screen directly into an in-memory PIL Image via Quartz.
+    Falls back to screencapture CLI if Quartz permissions fail.
+    """
+    try:
+        if bounds and len(bounds) == 4 and bounds[2] > 5 and bounds[3] > 5:
+            x, y, w, h = [int(v) for v in bounds]
+            rect = Quartz.CGRectMake(x, y, w, h)
+        else:
+            rect = Quartz.CGRectInfinite
+
+        cg_image = Quartz.CGWindowListCreateImage(
+            rect,
+            Quartz.kCGWindowListOptionOnScreenOnly,
+            Quartz.kCGNullWindowID,
+            Quartz.kCGWindowImageBestResolution | Quartz.kCGWindowImageBoundsIgnoreFraming
+        )
+
+        if cg_image is not None:
+            width = Quartz.CGImageGetWidth(cg_image)
+            height = Quartz.CGImageGetHeight(cg_image)
+            if width > 0 and height > 0:
+                color_space = Quartz.CGColorSpaceCreateDeviceRGB()
+                bytes_per_row = 4 * width
+                raw_data = bytearray(height * bytes_per_row)
+
+                context = Quartz.CGBitmapContextCreate(
+                    raw_data,
+                    width,
+                    height,
+                    8,
+                    bytes_per_row,
+                    color_space,
+                    Quartz.kCGImageAlphaPremultipliedLast | Quartz.kCGBitmapByteOrder32Big
+                )
+                Quartz.CGContextDrawImage(context, Quartz.CGRectMake(0, 0, width, height), cg_image)
+                pil_img = Image.frombytes("RGBA", (width, height), bytes(raw_data)).convert("RGB")
+                return pil_img
+
+    except Exception as e:
+        print(f"Quartz capture exception: {e}", file=sys.stderr)
+
+    # Secondary Fallback: screencapture CLI
+    temp_path = os.path.join(tempfile.gettempdir(), f"ai_snap_{os.getpid()}_{int(time.time()*1000)}.png")
+    try:
+        screencapture_bin = shutil.which("screencapture") or "/usr/sbin/screencapture"
+        if bounds and len(bounds) == 4:
+            x, y, w, h = [int(v) for v in bounds]
+            subprocess.run([screencapture_bin, "-x", f"-R{x},{y},{w},{h}", temp_path], check=True)
+        else:
+            subprocess.run([screencapture_bin, "-x", temp_path], check=True)
+
+        if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+            with Image.open(temp_path) as img:
+                pil_img = img.copy().convert("RGB")
+            os.remove(temp_path)
+            return pil_img
+    except Exception as e:
+        print(f"Screencapture fallback exception: {e}", file=sys.stderr)
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+
+    return None
 
 
 # ==============================================================================
@@ -192,24 +255,24 @@ def clean_log_text(text, show_emojis):
 
 
 # ==============================================================================
-# Configuration Persistence
+# Robust JSON Configuration Persistence
 # ==============================================================================
 
 def load_config():
     defaults = {
         "api_key": "",
         "model_name": "gemini-3.7-flash",
-        "text_color": [0.35, 0.95, 0.55, 1.0],
-        "bg_color": [0.06, 0.07, 0.09],
-        "overlay_opacity": 0.85,
-        "window_bg_opacity": 0.85,
-        "text_opacity": 1.0,
-        "timer_opacity": 0.85,
-        "show_dividers": True,
-        "show_emojis": True,
-        "log_ai_only": False,
-        "log_actions": True,
-        "log_hotkeys": True,
+        "text_color": [0.35, 0.95, 0.55, 1.0],   # Phosphor Green
+        "bg_color": [0.06, 0.07, 0.09],          # Stealth Neutral
+        "overlay_opacity": 0.85,                 # Master Window Opacity
+        "window_bg_opacity": 0.85,               # Background Fill Opacity
+        "text_opacity": 1.0,                     # Text Opacity
+        "timer_opacity": 0.85,                   # Countdown Timer Opacity
+        "show_dividers": True,                   # Enable/Disable --- dividers
+        "show_emojis": True,                     # Enable/Disable emojis
+        "log_ai_only": False,                    # Silent Mode (AI Output Only)
+        "log_actions": True,                     # Action/Buffer capture logs
+        "log_hotkeys": True,                     # Hotkey/Mode trigger logs
         "prompts": [
             "solve this for me",
             "summarize and provide a step-by-step concise answer",
@@ -221,7 +284,6 @@ def load_config():
         "master_key": "ctrl-opt-shift-s",
         "normal_key": "s",
         "scroll_key": "c",
-        "toggle_key": "z",
         "toggle_window_key": "h",
         "clear_key": "x",
         "edit_region_key": "r",
@@ -229,20 +291,46 @@ def load_config():
     }
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, "r") as f:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                defaults.update(data)
-        except Exception:
-            pass
+                if isinstance(data, dict):
+                    defaults.update(data)
+                    print(f"✅ [Config] Loaded {len(data)} settings from: {CONFIG_FILE}")
+        except Exception as e:
+            print(f"❌ [Config] Error reading {CONFIG_FILE}: {e}", file=sys.stderr)
+    else:
+        print(f"ℹ️ [Config] No existing config found. Will save to: {CONFIG_FILE}")
     return defaults
 
 
 def save_config(config):
     try:
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(config, f, indent=2)
-    except Exception:
-        pass
+        clean = {}
+        for k, v in config.items():
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                clean[k] = v
+            elif isinstance(v, (list, tuple)):
+                clean_list = []
+                for item in v:
+                    if isinstance(item, (int, float, bool, str)) or item is None:
+                        clean_list.append(item)
+                    else:
+                        clean_list.append(str(item))
+                clean[k] = clean_list
+            else:
+                clean[k] = str(v)
+
+        json_str = json.dumps(clean, indent=2, ensure_ascii=False)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            f.write(json_str)
+            f.flush()
+            os.fsync(f.fileno())
+
+        print(f"✅ [Config] Successfully saved {len(clean)} items to: {CONFIG_FILE}")
+        return True
+    except Exception as e:
+        print(f"❌ [Config] Save failed for {CONFIG_FILE}: {e}", file=sys.stderr)
+        return False
 
 
 # ==============================================================================
@@ -555,13 +643,15 @@ class SettingsWindow(NSWindow):
         NSApp().activateIgnoringOtherApps_(True)
         self.makeKeyAndOrderFront_(None)
 
+        cfg = self.app_delegate.config
+
         # 1. API & Model Setup
         lbl_api = NSTextField.labelWithString_("Gemini API Key:")
         lbl_api.setFrame_(NSMakeRect(20, 785, 170, 20))
         self.contentView().addSubview_(lbl_api)
 
         self.api_field = NSTextField.alloc().initWithFrame_(NSMakeRect(200, 783, 440, 22))
-        self.api_field.setStringValue_(self.app_delegate.config.get("api_key", ""))
+        self.api_field.setStringValue_(str(cfg.get("api_key", "")))
         self.api_field.setEditable_(True)
         self.api_field.setSelectable_(True)
         self.api_field.setBordered_(True)
@@ -574,7 +664,7 @@ class SettingsWindow(NSWindow):
         self.contentView().addSubview_(lbl_model)
 
         self.model_field = NSTextField.alloc().initWithFrame_(NSMakeRect(200, 748, 440, 22))
-        self.model_field.setStringValue_(self.app_delegate.config.get("model_name", "gemini-3.7-flash"))
+        self.model_field.setStringValue_(str(cfg.get("model_name", "gemini-3.7-flash")))
         self.model_field.setEditable_(True)
         self.model_field.setSelectable_(True)
         self.model_field.setBordered_(True)
@@ -583,14 +673,14 @@ class SettingsWindow(NSWindow):
         self.contentView().addSubview_(self.model_field)
 
         # 2. Prompts 1, 2, 3
-        prompts = self.app_delegate.config.get("prompts", ["solve this for me", "", ""])
+        prompts = cfg.get("prompts", ["solve this for me", "", ""])
 
         lbl_p1 = NSTextField.labelWithString_("Prompt 1 [Key 1]:")
         lbl_p1.setFrame_(NSMakeRect(20, 710, 170, 20))
         self.contentView().addSubview_(lbl_p1)
 
         self.p1_field = NSTextField.alloc().initWithFrame_(NSMakeRect(200, 708, 345, 22))
-        self.p1_field.setStringValue_(prompts[0] if len(prompts) > 0 else "")
+        self.p1_field.setStringValue_(str(prompts[0]) if len(prompts) > 0 else "")
         self.contentView().addSubview_(self.p1_field)
 
         self.p1_btn = NSButton.alloc().initWithFrame_(NSMakeRect(555, 706, 85, 24))
@@ -605,7 +695,7 @@ class SettingsWindow(NSWindow):
         self.contentView().addSubview_(lbl_p2)
 
         self.p2_field = NSTextField.alloc().initWithFrame_(NSMakeRect(200, 673, 345, 22))
-        self.p2_field.setStringValue_(prompts[1] if len(prompts) > 1 else "")
+        self.p2_field.setStringValue_(str(prompts[1]) if len(prompts) > 1 else "")
         self.contentView().addSubview_(self.p2_field)
 
         self.p2_btn = NSButton.alloc().initWithFrame_(NSMakeRect(555, 671, 85, 24))
@@ -620,7 +710,7 @@ class SettingsWindow(NSWindow):
         self.contentView().addSubview_(lbl_p3)
 
         self.p3_field = NSTextField.alloc().initWithFrame_(NSMakeRect(200, 638, 345, 22))
-        self.p3_field.setStringValue_(prompts[2] if len(prompts) > 2 else "")
+        self.p3_field.setStringValue_(str(prompts[2]) if len(prompts) > 2 else "")
         self.contentView().addSubview_(self.p3_field)
 
         self.p3_btn = NSButton.alloc().initWithFrame_(NSMakeRect(555, 636, 85, 24))
@@ -638,7 +728,7 @@ class SettingsWindow(NSWindow):
         self.contentView().addSubview_(lbl_master)
 
         self.master_field = HotkeyField.alloc().initWithFrame_(NSMakeRect(200, 593, 140, 22))
-        self.master_field.setStringValue_(self.app_delegate.config.get("master_key", "ctrl-opt-shift-s"))
+        self.master_field.setStringValue_(str(cfg.get("master_key", "ctrl-opt-shift-s")))
         self.contentView().addSubview_(self.master_field)
 
         lbl_stat = NSTextField.labelWithString_("Stationary Snap Key:")
@@ -646,7 +736,7 @@ class SettingsWindow(NSWindow):
         self.contentView().addSubview_(lbl_stat)
 
         self.normal_field = HotkeyField.alloc().initWithFrame_(NSMakeRect(515, 593, 125, 22))
-        self.normal_field.setStringValue_(self.app_delegate.config.get("normal_key", "s"))
+        self.normal_field.setStringValue_(str(cfg.get("normal_key", "s")))
         self.contentView().addSubview_(self.normal_field)
 
         lbl_scroll = NSTextField.labelWithString_("Scrolling Snap Key:")
@@ -654,23 +744,23 @@ class SettingsWindow(NSWindow):
         self.contentView().addSubview_(lbl_scroll)
 
         self.scroll_field = HotkeyField.alloc().initWithFrame_(NSMakeRect(200, 558, 140, 22))
-        self.scroll_field.setStringValue_(self.app_delegate.config.get("scroll_key", "c"))
+        self.scroll_field.setStringValue_(str(cfg.get("scroll_key", "c")))
         self.contentView().addSubview_(self.scroll_field)
 
         lbl_tog = NSTextField.labelWithString_("Toggle HUD Window:")
         lbl_tog.setFrame_(NSMakeRect(360, 560, 150, 20))
         self.contentView().addSubview_(lbl_tog)
 
-        self.toggle_field = HotkeyField.alloc().initWithFrame_(NSMakeRect(515, 558, 125, 22))
-        self.toggle_field.setStringValue_(self.app_delegate.config.get("toggle_window_key", "h"))
-        self.contentView().addSubview_(self.toggle_field)
+        self.toggle_window_field = HotkeyField.alloc().initWithFrame_(NSMakeRect(515, 558, 125, 22))
+        self.toggle_window_field.setStringValue_(str(cfg.get("toggle_window_key", "h")))
+        self.contentView().addSubview_(self.toggle_window_field)
 
         lbl_clear = NSTextField.labelWithString_("Clear Buffer Key:")
         lbl_clear.setFrame_(NSMakeRect(20, 525, 170, 20))
         self.contentView().addSubview_(lbl_clear)
 
         self.clear_field = HotkeyField.alloc().initWithFrame_(NSMakeRect(200, 523, 140, 22))
-        self.clear_field.setStringValue_(self.app_delegate.config.get("clear_key", "x"))
+        self.clear_field.setStringValue_(str(cfg.get("clear_key", "x")))
         self.contentView().addSubview_(self.clear_field)
 
         lbl_edit = NSTextField.labelWithString_("Edit Crop Region Key:")
@@ -678,7 +768,7 @@ class SettingsWindow(NSWindow):
         self.contentView().addSubview_(lbl_edit)
 
         self.edit_region_field = HotkeyField.alloc().initWithFrame_(NSMakeRect(515, 523, 125, 22))
-        self.edit_region_field.setStringValue_(self.app_delegate.config.get("edit_region_key", "r"))
+        self.edit_region_field.setStringValue_(str(cfg.get("edit_region_key", "r")))
         self.contentView().addSubview_(self.edit_region_field)
 
         lbl_auto = NSTextField.labelWithString_("Auto Mode Loop Key:")
@@ -686,32 +776,32 @@ class SettingsWindow(NSWindow):
         self.contentView().addSubview_(lbl_auto)
 
         self.auto_mode_field = HotkeyField.alloc().initWithFrame_(NSMakeRect(200, 488, 140, 22))
-        self.auto_mode_field.setStringValue_(self.app_delegate.config.get("auto_mode_key", "a"))
+        self.auto_mode_field.setStringValue_(str(cfg.get("auto_mode_key", "a")))
         self.contentView().addSubview_(self.auto_mode_field)
 
         # 4. Status Logging Toggles
         self.dividers_checkbox = NSButton.alloc().initWithFrame_(NSMakeRect(200, 450, 200, 22))
         self.dividers_checkbox.setButtonType_(AppKit.NSButtonTypeSwitch)
         self.dividers_checkbox.setTitle_("Show Line Dividers (---)")
-        self.dividers_checkbox.setState_(1 if self.app_delegate.config.get("show_dividers", True) else 0)
+        self.dividers_checkbox.setState_(1 if cfg.get("show_dividers", True) else 0)
         self.contentView().addSubview_(self.dividers_checkbox)
 
         self.emojis_checkbox = NSButton.alloc().initWithFrame_(NSMakeRect(420, 450, 180, 22))
         self.emojis_checkbox.setButtonType_(AppKit.NSButtonTypeSwitch)
         self.emojis_checkbox.setTitle_("Show Status Emojis")
-        self.emojis_checkbox.setState_(1 if self.app_delegate.config.get("show_emojis", True) else 0)
+        self.emojis_checkbox.setState_(1 if cfg.get("show_emojis", True) else 0)
         self.contentView().addSubview_(self.emojis_checkbox)
 
         self.ai_only_checkbox = NSButton.alloc().initWithFrame_(NSMakeRect(200, 420, 210, 22))
         self.ai_only_checkbox.setButtonType_(AppKit.NSButtonTypeSwitch)
         self.ai_only_checkbox.setTitle_("Silent Mode (AI Output Only)")
-        self.ai_only_checkbox.setState_(1 if self.app_delegate.config.get("log_ai_only", False) else 0)
+        self.ai_only_checkbox.setState_(1 if cfg.get("log_ai_only", False) else 0)
         self.contentView().addSubview_(self.ai_only_checkbox)
 
         self.action_logs_checkbox = NSButton.alloc().initWithFrame_(NSMakeRect(420, 420, 200, 22))
         self.action_logs_checkbox.setButtonType_(AppKit.NSButtonTypeSwitch)
         self.action_logs_checkbox.setTitle_("Show Action Capture Logs")
-        self.action_logs_checkbox.setState_(1 if self.app_delegate.config.get("log_actions", True) else 0)
+        self.action_logs_checkbox.setState_(1 if cfg.get("log_actions", True) else 0)
         self.contentView().addSubview_(self.action_logs_checkbox)
 
         # 5. Opacity Controls (0.0 to 1.0)
@@ -722,7 +812,7 @@ class SettingsWindow(NSWindow):
         self.master_opacity_slider = NSSlider.alloc().initWithFrame_(NSMakeRect(200, 373, 440, 24))
         self.master_opacity_slider.setMinValue_(0.0)
         self.master_opacity_slider.setMaxValue_(1.0)
-        self.master_opacity_slider.setDoubleValue_(self.app_delegate.config.get("overlay_opacity", 0.85))
+        self.master_opacity_slider.setDoubleValue_(float(cfg.get("overlay_opacity", 0.85)))
         self.master_opacity_slider.setTarget_(self)
         self.master_opacity_slider.setAction_("masterOpacityChanged:")
         self.contentView().addSubview_(self.master_opacity_slider)
@@ -734,7 +824,7 @@ class SettingsWindow(NSWindow):
         self.bg_opacity_slider = NSSlider.alloc().initWithFrame_(NSMakeRect(200, 333, 440, 24))
         self.bg_opacity_slider.setMinValue_(0.0)
         self.bg_opacity_slider.setMaxValue_(1.0)
-        self.bg_opacity_slider.setDoubleValue_(self.app_delegate.config.get("window_bg_opacity", 0.85))
+        self.bg_opacity_slider.setDoubleValue_(float(cfg.get("window_bg_opacity", 0.85)))
         self.bg_opacity_slider.setTarget_(self)
         self.bg_opacity_slider.setAction_("bgOpacityChanged:")
         self.contentView().addSubview_(self.bg_opacity_slider)
@@ -746,7 +836,7 @@ class SettingsWindow(NSWindow):
         self.text_opacity_slider = NSSlider.alloc().initWithFrame_(NSMakeRect(200, 293, 440, 24))
         self.text_opacity_slider.setMinValue_(0.0)
         self.text_opacity_slider.setMaxValue_(1.0)
-        self.text_opacity_slider.setDoubleValue_(self.app_delegate.config.get("text_opacity", 1.0))
+        self.text_opacity_slider.setDoubleValue_(float(cfg.get("text_opacity", 1.0)))
         self.text_opacity_slider.setTarget_(self)
         self.text_opacity_slider.setAction_("textOpacityChanged:")
         self.contentView().addSubview_(self.text_opacity_slider)
@@ -758,7 +848,7 @@ class SettingsWindow(NSWindow):
         self.timer_opacity_slider = NSSlider.alloc().initWithFrame_(NSMakeRect(200, 253, 440, 24))
         self.timer_opacity_slider.setMinValue_(0.0)
         self.timer_opacity_slider.setMaxValue_(1.0)
-        self.timer_opacity_slider.setDoubleValue_(self.app_delegate.config.get("timer_opacity", 0.85))
+        self.timer_opacity_slider.setDoubleValue_(float(cfg.get("timer_opacity", 0.85)))
         self.timer_opacity_slider.setTarget_(self)
         self.timer_opacity_slider.setAction_("timerOpacityChanged:")
         self.contentView().addSubview_(self.timer_opacity_slider)
@@ -768,8 +858,9 @@ class SettingsWindow(NSWindow):
         lbl_color.setFrame_(NSMakeRect(20, 200, 170, 20))
         self.contentView().addSubview_(lbl_color)
 
+        t_rgba = cfg.get("text_color", [0.35, 0.95, 0.55, 1.0])
         self.text_color_well = NSColorWell.alloc().initWithFrame_(NSMakeRect(200, 196, 100, 28))
-        self.text_color_well.setColor_(NSColor.colorWithRed_green_blue_alpha_(*self.app_delegate.config["text_color"]))
+        self.text_color_well.setColor_(NSColor.colorWithRed_green_blue_alpha_(t_rgba[0], t_rgba[1], t_rgba[2], t_rgba[3]))
         self.text_color_well.setTarget_(self)
         self.text_color_well.setAction_("textColorChanged:")
         self.contentView().addSubview_(self.text_color_well)
@@ -783,7 +874,7 @@ class SettingsWindow(NSWindow):
         lbl_bg_color.setFrame_(NSMakeRect(20, 155, 170, 20))
         self.contentView().addSubview_(lbl_bg_color)
 
-        bg_stored = self.app_delegate.config.get("bg_color", [0.06, 0.07, 0.09])
+        bg_stored = cfg.get("bg_color", [0.06, 0.07, 0.09])
         self.bg_color_well = NSColorWell.alloc().initWithFrame_(NSMakeRect(200, 151, 100, 28))
         self.bg_color_well.setColor_(NSColor.colorWithRed_green_blue_alpha_(bg_stored[0], bg_stored[1], bg_stored[2], 1.0))
         self.bg_color_well.setTarget_(self)
@@ -813,17 +904,23 @@ class SettingsWindow(NSWindow):
 
     def setP1Active_(self, sender):
         self.app_delegate.active_prompt_index = 0
+        self.app_delegate.config["active_prompt_index"] = 0
         self._update_prompt_btn_styles()
+        save_config(self.app_delegate.config)
         self.app_delegate.log_to_window("🎯 [Prompt 1 Selected]", tag="hotkey")
 
     def setP2Active_(self, sender):
         self.app_delegate.active_prompt_index = 1
+        self.app_delegate.config["active_prompt_index"] = 1
         self._update_prompt_btn_styles()
+        save_config(self.app_delegate.config)
         self.app_delegate.log_to_window("🎯 [Prompt 2 Selected]", tag="hotkey")
 
     def setP3Active_(self, sender):
         self.app_delegate.active_prompt_index = 2
+        self.app_delegate.config["active_prompt_index"] = 2
         self._update_prompt_btn_styles()
+        save_config(self.app_delegate.config)
         self.app_delegate.log_to_window("🎯 [Prompt 3 Selected]", tag="hotkey")
 
     def setEditingHotkeyField_(self, field):
@@ -832,27 +929,28 @@ class SettingsWindow(NSWindow):
     def windowShouldClose_(self, sender):
         self.orderOut_(None)
         self.editing_hotkey_field = None
-        return False
+        self.app_delegate.settings_win = None
+        return True
 
     def masterOpacityChanged_(self, sender):
-        alpha = sender.doubleValue()
+        alpha = float(sender.doubleValue())
         self.app_delegate.config["overlay_opacity"] = alpha
         if hasattr(self.app_delegate, "panel"):
             self.app_delegate.panel.setOverlayOpacity_(alpha)
 
     def bgOpacityChanged_(self, sender):
-        alpha = sender.doubleValue()
+        alpha = float(sender.doubleValue())
         self.app_delegate.config["window_bg_opacity"] = alpha
         if hasattr(self.app_delegate, "panel"):
             self.app_delegate.panel.apply_background()
 
     def textOpacityChanged_(self, sender):
-        alpha = sender.doubleValue()
+        alpha = float(sender.doubleValue())
         self.app_delegate.config["text_opacity"] = alpha
         self.app_delegate.apply_stored_text_color()
 
     def timerOpacityChanged_(self, sender):
-        alpha = sender.doubleValue()
+        alpha = float(sender.doubleValue())
         self.app_delegate.config["timer_opacity"] = alpha
         if hasattr(self.app_delegate, "countdown_overlay"):
             self.app_delegate.countdown_overlay.setOverlayOpacity_(alpha)
@@ -862,10 +960,10 @@ class SettingsWindow(NSWindow):
         rgb_color = color.colorUsingColorSpace_(NSColorSpace.sRGBColorSpace())
         if rgb_color is not None:
             self.app_delegate.config["text_color"] = [
-                rgb_color.redComponent(),
-                rgb_color.greenComponent(),
-                rgb_color.blueComponent(),
-                rgb_color.alphaComponent(),
+                float(rgb_color.redComponent()),
+                float(rgb_color.greenComponent()),
+                float(rgb_color.blueComponent()),
+                float(rgb_color.alphaComponent()),
             ]
             self.text_color_preview.layer().setBackgroundColor_(rgb_color.CGColor())
             self.app_delegate.apply_stored_text_color()
@@ -875,47 +973,82 @@ class SettingsWindow(NSWindow):
         rgb_color = color.colorUsingColorSpace_(NSColorSpace.sRGBColorSpace())
         if rgb_color is not None:
             self.app_delegate.config["bg_color"] = [
-                rgb_color.redComponent(),
-                rgb_color.greenComponent(),
-                rgb_color.blueComponent(),
+                float(rgb_color.redComponent()),
+                float(rgb_color.greenComponent()),
+                float(rgb_color.blueComponent()),
             ]
             self.bg_color_preview.layer().setBackgroundColor_(rgb_color.CGColor())
             if hasattr(self.app_delegate, "panel"):
                 self.app_delegate.panel.apply_background()
 
     def saveSettings_(self, sender):
-        cfg = self.app_delegate.config
-        cfg["api_key"] = self.api_field.stringValue().strip()
-        cfg["model_name"] = self.model_field.stringValue().strip() or "gemini-3.7-flash"
-        cfg["prompts"] = [
-            self.p1_field.stringValue(),
-            self.p2_field.stringValue(),
-            self.p3_field.stringValue()
-        ]
-        cfg["active_prompt_index"] = self.app_delegate.active_prompt_index
-        cfg["master_key"] = normalize_hotkey(self.master_field.stringValue()) or "ctrl-opt-shift-s"
-        cfg["normal_key"] = normalize_hotkey(self.normal_field.stringValue()) or "s"
-        cfg["scroll_key"] = normalize_hotkey(self.scroll_field.stringValue()) or "c"
-        cfg["toggle_key"] = normalize_hotkey(self.toggle_field.stringValue()) or "z"
-        cfg["toggle_window_key"] = normalize_hotkey(self.toggle_window_field.stringValue()) or "h"
-        cfg["clear_key"] = normalize_hotkey(self.clear_field.stringValue()) or "x"
-        cfg["edit_region_key"] = normalize_hotkey(self.edit_region_field.stringValue()) or "r"
-        cfg["auto_mode_key"] = normalize_hotkey(self.auto_mode_field.stringValue()) or "a"
-        cfg["show_dividers"] = bool(self.dividers_checkbox.state() == 1)
-        cfg["show_emojis"] = bool(self.emojis_checkbox.state() == 1)
-        cfg["log_ai_only"] = bool(self.ai_only_checkbox.state() == 1)
-        cfg["log_actions"] = bool(self.action_logs_checkbox.state() == 1)
-        cfg["overlay_opacity"] = self.master_opacity_slider.doubleValue()
-        cfg["window_bg_opacity"] = self.bg_opacity_slider.doubleValue()
-        cfg["text_opacity"] = self.text_opacity_slider.doubleValue()
-        cfg["timer_opacity"] = self.timer_opacity_slider.doubleValue()
+        try:
+            cfg = dict(self.app_delegate.config)
+            cfg["api_key"] = str(self.api_field.stringValue() or "").strip()
+            cfg["model_name"] = str(self.model_field.stringValue() or "").strip() or "gemini-3.7-flash"
+            cfg["prompts"] = [
+                str(self.p1_field.stringValue() or ""),
+                str(self.p2_field.stringValue() or ""),
+                str(self.p3_field.stringValue() or "")
+            ]
+            cfg["active_prompt_index"] = int(self.app_delegate.active_prompt_index)
+            cfg["master_key"] = normalize_hotkey(str(self.master_field.stringValue() or "")) or "ctrl-opt-shift-s"
+            cfg["normal_key"] = normalize_hotkey(str(self.normal_field.stringValue() or "")) or "s"
+            cfg["scroll_key"] = normalize_hotkey(str(self.scroll_field.stringValue() or "")) or "c"
+            cfg["toggle_window_key"] = normalize_hotkey(str(self.toggle_window_field.stringValue() or "")) or "h"
+            cfg["clear_key"] = normalize_hotkey(str(self.clear_field.stringValue() or "")) or "x"
+            cfg["edit_region_key"] = normalize_hotkey(str(self.edit_region_field.stringValue() or "")) or "r"
+            cfg["auto_mode_key"] = normalize_hotkey(str(self.auto_mode_field.stringValue() or "")) or "a"
+            cfg["show_dividers"] = bool(self.dividers_checkbox.state() == 1)
+            cfg["show_emojis"] = bool(self.emojis_checkbox.state() == 1)
+            cfg["log_ai_only"] = bool(self.ai_only_checkbox.state() == 1)
+            cfg["log_actions"] = bool(self.action_logs_checkbox.state() == 1)
+            cfg["overlay_opacity"] = float(self.master_opacity_slider.doubleValue())
+            cfg["window_bg_opacity"] = float(self.bg_opacity_slider.doubleValue())
+            cfg["text_opacity"] = float(self.text_opacity_slider.doubleValue())
+            cfg["timer_opacity"] = float(self.timer_opacity_slider.doubleValue())
 
-        save_config(cfg)
-        self.app_delegate.reinit_client()
-        self.app_delegate.log_to_window(f"💾 [Settings] Config saved. Engine: {cfg['model_name']}", tag="system")
+            # Read color wells
+            try:
+                t_col = self.text_color_well.color().colorUsingColorSpace_(NSColorSpace.sRGBColorSpace())
+                if t_col is not None:
+                    cfg["text_color"] = [float(t_col.redComponent()), float(t_col.greenComponent()), float(t_col.blueComponent()), float(t_col.alphaComponent())]
+            except Exception:
+                pass
 
-        self.orderOut_(None)
-        self.close()
+            try:
+                b_col = self.bg_color_well.color().colorUsingColorSpace_(NSColorSpace.sRGBColorSpace())
+                if b_col is not None:
+                    cfg["bg_color"] = [float(b_col.redComponent()), float(b_col.greenComponent()), float(b_col.blueComponent())]
+            except Exception:
+                pass
+
+            # Save to disk
+            ok = save_config(cfg)
+            if ok:
+                self.app_delegate.config = cfg
+                self.app_delegate.reinit_client()
+                self.app_delegate.apply_stored_text_color()
+
+                if hasattr(self.app_delegate, "panel"):
+                    self.app_delegate.panel.apply_background()
+                    self.app_delegate.panel.setOverlayOpacity_(cfg["overlay_opacity"])
+
+                if hasattr(self.app_delegate, "countdown_overlay"):
+                    self.app_delegate.countdown_overlay.setOverlayOpacity_(cfg["timer_opacity"])
+
+                self.app_delegate.log_to_window(f"💾 [Settings] Saved to {os.path.basename(CONFIG_FILE)}", tag="system")
+            else:
+                self.app_delegate.log_to_window("❌ [Settings] Failed to save config to disk.", tag="system")
+
+        except Exception as e:
+            print(f"[Settings] Error in saveSettings: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+
+        finally:
+            self.orderOut_(None)
+            self.app_delegate.settings_win = None
 
 
 # ==============================================================================
@@ -927,8 +1060,9 @@ class AppDelegate:
         self.config = load_config()
         self._normalize_config_hotkeys()
         self.selected_crop_area = self._load_selected_crop_area()
-        self.active_prompt_index = self.config.get("active_prompt_index", 0)
+        self.active_prompt_index = int(self.config.get("active_prompt_index", 0))
         self.region_overlay = None
+        self.settings_win = None
         self.is_scrolling_mode = False
         self.auto_mode_active = False
         self.master_activation_active = False
@@ -1008,6 +1142,9 @@ class AppDelegate:
         self.event_tap_source = None
         self._init_skhd_event_tap()
 
+        # Check Screen Recording Permission on startup
+        check_and_request_screen_recording()
+
         self.print_initial_status()
 
     @objc.python_method
@@ -1084,7 +1221,6 @@ class AppDelegate:
         master_key = normalize_hotkey(self.config.get("master_key", "ctrl-opt-shift-s"))
         normal_key = normalize_hotkey(self.config.get("normal_key", "s"))
         scroll_key = normalize_hotkey(self.config.get("scroll_key", "c"))
-        toggle_key = normalize_hotkey(self.config.get("toggle_key", "z"))
         toggle_window_key = normalize_hotkey(self.config.get("toggle_window_key", "h"))
         clear_key = normalize_hotkey(self.config.get("clear_key", "x"))
         edit_region_key = normalize_hotkey(self.config.get("edit_region_key", "r"))
@@ -1096,7 +1232,6 @@ class AppDelegate:
         current_tail = key_tail(current_hotkey)
         normal_tail = key_tail(normal_key)
         scroll_tail = key_tail(scroll_key)
-        toggle_tail = key_tail(toggle_key)
         toggle_window_tail = key_tail(toggle_window_key)
         clear_tail = key_tail(clear_key)
         edit_tail = key_tail(edit_region_key)
@@ -1109,7 +1244,7 @@ class AppDelegate:
             if self.master_activation_active:
                 self.log_to_window(
                     "🔮 [Master Mode: LOCKED ON]\n"
-                    "   Keys: [S] Snap | [C] Scroll | [H/Z] HUD | [X] Clear | [R] Crop | [A] Auto\n"
+                    "   Keys: [S] Snap | [C] Scroll | [H] HUD | [X] Clear | [R] Crop | [A] Auto\n"
                     "   Prompts: [1] Prompt 1 | [2] Prompt 2 | [3] Prompt 3\n"
                     "   (Press Master shortcut again to unlock)",
                     tag="hotkey"
@@ -1154,8 +1289,7 @@ class AppDelegate:
                 self.log_to_window("⌨️ [Hotkey: C] Scrolling Capture triggered.", tag="hotkey")
                 AppHelper.callAfter(self.execute_pipeline, True)
                 return True
-            elif (current_hotkey == toggle_key or current_tail == toggle_tail) or \
-                 (current_hotkey == toggle_window_key or current_tail == toggle_window_tail):
+            elif current_hotkey == toggle_window_key or current_tail == toggle_window_tail:
                 self.log_to_window("⌨️ [Hotkey: Toggle] Overlay Visibility toggled.", tag="hotkey")
                 AppHelper.callAfter(self.toggleWindowVisibility_, None)
                 return True
@@ -1180,8 +1314,7 @@ class AppDelegate:
             self.log_to_window("⌨️ [Combo] Scrolling Capture triggered.", tag="hotkey")
             AppHelper.callAfter(self.execute_pipeline, True)
             return True
-        elif (current_hotkey == toggle_key and self._can_trigger_outside_master(toggle_key)) or \
-             (current_hotkey == toggle_window_key and self._can_trigger_outside_master(toggle_window_key)):
+        elif current_hotkey == toggle_window_key and self._can_trigger_outside_master(toggle_window_key):
             AppHelper.callAfter(self.toggleWindowVisibility_, None)
             return True
         elif current_hotkey == clear_key and self._can_trigger_outside_master(clear_key):
@@ -1204,7 +1337,6 @@ class AppDelegate:
             "master_key": "ctrl-opt-shift-s",
             "normal_key": "s",
             "scroll_key": "c",
-            "toggle_key": "z",
             "toggle_window_key": "h",
             "clear_key": "x",
             "edit_region_key": "r",
@@ -1259,7 +1391,7 @@ class AppDelegate:
 
     def reinit_client(self):
         try:
-            api_key = self.config.get("api_key", "").strip()
+            api_key = str(self.config.get("api_key", "")).strip()
             if not api_key:
                 api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
             if api_key:
@@ -1330,16 +1462,15 @@ class AppDelegate:
 
     def openSettings_(self, sender):
         if getattr(self, "settings_win", None) is not None:
-            self.settings_win.makeKeyAndOrderFront_(None)
-            NSApp().activateIgnoringOtherApps_(True)
-            return
+            self.settings_win.orderOut_(None)
+            self.settings_win = None
         self.settings_win = SettingsWindow.alloc().initWithApp_(self)
 
     def activateMasterFromMenu_(self, sender):
         self.master_activation_active = not self.master_activation_active
         self._refresh_menu_labels()
         if self.master_activation_active:
-            self.log_to_window("🔮 [Master Mode: LOCKED ON] Keys: [S] Snap | [C] Scroll | [H/Z] HUD | [X] Clear | [R] Crop | [A] Auto | [1/2/3] Prompts", tag="hotkey")
+            self.log_to_window("🔮 [Master Mode: LOCKED ON] Keys: [S] Snap | [C] Scroll | [H] HUD | [X] Clear | [R] Crop | [A] Auto | [1/2/3] Prompts", tag="hotkey")
         else:
             self.log_to_window("🔓 [Master Mode: UNLOCKED] Standard typing restored.", tag="hotkey")
 
@@ -1391,31 +1522,37 @@ class AppDelegate:
             idx = 0
         base_prompt = prompts[idx] or "solve this for me"
 
-        self.log_to_window(f"⚡ [Action] Screen capture ({mode_str} Mode) [P{idx+1}]...", tag="action")
+        # 1. Target region log
+        if self.selected_crop_area:
+            x, y, w, h = self.selected_crop_area
+            self.log_to_window(f"📸 [Capture] Region: {w}x{h} at ({x}, {y}) ({mode_str} Mode) [P{idx+1}]...", tag="action")
+        else:
+            self.log_to_window(f"📸 [Capture] Fullscreen ({mode_str} Mode) [P{idx+1}]...", tag="action")
 
         if not self.client:
-            self.log_to_window("❌ [Error] API Client uninitialized. Set your API Key in Settings GUI.", tag="ai")
+            self.log_to_window("❌ [Error] API Client uninitialized. Enter your API Key in Settings GUI.", tag="ai")
             return
 
-        # Use bundle-safe unique temporary file in tempfile.gettempdir()
-        temp_img = os.path.join(tempfile.gettempdir(), f"ai_solver_snap_{os.getpid()}.png")
+        # 2. In-memory capture
+        shot = capture_screen_to_pil(self.selected_crop_area)
 
+        if shot is None:
+            self.log_to_window(
+                "⚠️ [Capture Error]: Screen Recording permission missing. "
+                "Enable it in System Settings > Privacy & Security > Screen Recording for Terminal/Python.",
+                tag="ai"
+            )
+            return
+
+        # 3. Buffer telemetry log
+        buf = io.BytesIO()
+        shot.save(buf, format="PNG")
+        file_size_kb = len(buf.getvalue()) / 1024.0
+        width, height = shot.size
+        self.log_to_window(f"🖼️ [Buffer] Captured image ({width}x{height}, {file_size_kb:.1f} KB). Sending to {model_name}...", tag="action")
+
+        # 4. Dispatch to Gemini
         try:
-            # Dynamically resolve screencapture executable for .app bundle environments
-            screencapture_bin = shutil.which("screencapture") or "/usr/sbin/screencapture"
-
-            if self.selected_crop_area:
-                x, y, w, h = self.selected_crop_area
-                subprocess.run([screencapture_bin, "-x", f"-R{x},{y},{w},{h}", temp_img], check=True)
-            else:
-                subprocess.run([screencapture_bin, "-x", temp_img], check=True)
-
-            if not os.path.exists(temp_img):
-                raise Exception("Failed to write screenshot buffer.")
-
-            file_size_kb = os.path.getsize(temp_img) / 1024.0
-            self.log_to_window(f"🖼️ [Buffer] Captured {file_size_kb:.1f} KB image. Querying {model_name}...", tag="action")
-
             prompt = base_prompt
             if scrolling:
                 prompt += (
@@ -1423,26 +1560,17 @@ class AppDelegate:
                     "Solve the appended cascading context details."
                 )
 
-            with Image.open(temp_img) as shot:
-                res = self.client.models.generate_content(
-                    model=model_name,
-                    contents=[prompt, shot]
-                )
+            res = self.client.models.generate_content(
+                model=model_name,
+                contents=[prompt, shot]
+            )
 
             elapsed = time.time() - start_time
             ai_output = res.text or "(Empty Response)"
             self.log_to_window(f"🤖 [AI Engine ({model_name})] Solved in {elapsed:.2f}s:\n\n{ai_output}", tag="ai")
 
-            if os.path.exists(temp_img):
-                os.remove(temp_img)
-
         except Exception as e:
             self.log_to_window(f"⚠️ [Pipeline Error]: {str(e)}", tag="ai")
-            if os.path.exists(temp_img):
-                try:
-                    os.remove(temp_img)
-                except Exception:
-                    pass
 
 
 if __name__ == "__main__":
